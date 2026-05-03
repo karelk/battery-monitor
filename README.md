@@ -46,7 +46,7 @@ Edit `battery-monitor.c` and recompile to adjust thresholds:
 
 ```c
 #define ALERT_THRESHOLD 12      // Start audio alerts at 12%
-#define SHUTDOWN_THRESHOLD 7    // Emergency shutdown at 7%
+#define SHUTDOWN_THRESHOLD 8    // Emergency shutdown at 8%
 #define ALERT_SOUND "/usr/local/share/sounds/warning-loud-shrill-chime.wav"
 ```
 
