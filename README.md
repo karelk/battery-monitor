@@ -72,6 +72,3 @@ Adaptive check intervals:
 
 Follows Unix philosophy: simple, focused, minimal dependencies. Uses kernel netlink sockets directly instead of relying on higher-level power management daemons. Suitable for custom/minimal Linux installations.
 
-## License
-
-MIT
