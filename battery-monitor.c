@@ -8,10 +8,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <signal.h>
+#include <syslog.h>
 #include <linux/limits.h>
 
 #define ALERT_THRESHOLD 12
-#define SHUTDOWN_THRESHOLD 7
+#define SHUTDOWN_THRESHOLD 8
 #define ALERT_SOUND "/usr/local/share/sounds/warning-loud-shrill-chime.wav"
 #define UEVENT_BUFFER_SIZE 8192
 
@@ -32,7 +33,7 @@ int read_battery_status(char *status, int *capacity) {
 
     dir = opendir("/sys/class/power_supply");
     if (!dir) {
-        perror("Error opening /sys/class/power_supply");
+        syslog(LOG_ERR, "Error opening /sys/class/power_supply: %m");
         return -1;
     }
 
@@ -79,17 +80,15 @@ int read_battery_status(char *status, int *capacity) {
 }
 
 void play_alert(void) {
-    fflush(stdout);
-
     pid_t pid = fork();
     if (pid < 0) {
-        perror("fork failed");
+        syslog(LOG_ERR, "fork failed: %m");
         return;
     }
 
     if (pid == 0) {
-        execl("/usr/local/bin/aplay", "aplay", ALERT_SOUND, NULL);
-        perror("execl failed");
+        execl("/usr/local/bin/aplay", "aplay", "-q", ALERT_SOUND, NULL);
+        syslog(LOG_ERR, "execl failed: %m");
         exit(1);
     }
 }
@@ -99,8 +98,10 @@ int get_check_interval(int capacity) {
         return 300;
     else if (capacity > 25)
         return 180;
-    else
+    else if (capacity > 15)
         return 60;
+    else
+        return 30;
 }
 
 void monitor_battery_loop(void) {
@@ -120,14 +121,15 @@ void monitor_battery_loop(void) {
 
         if (capacity <= SHUTDOWN_THRESHOLD) {
             play_alert();
-            printf("CRITICAL: Battery at %d%% - initiating immediate shutdown\n", capacity);
+            syslog(LOG_CRIT, "Battery at %d%% - initiating immediate shutdown", capacity);
             system("/sbin/shutdown -h now 'Battery critically low - emergency shutdown'");
+            closelog();
             exit(0);
         }
 
         if (capacity < ALERT_THRESHOLD) {
             if (capacity != last_alerted_capacity) {
-                printf("WARNING: Battery at %d%%\n", capacity);
+                syslog(LOG_WARNING, "Battery at %d%%", capacity);
                 play_alert();
                 last_alerted_capacity = capacity;
             }
@@ -146,8 +148,14 @@ void listen_for_ac_events(int sock) {
 
     while (running) {
         len = recv(sock, buffer, sizeof(buffer), 0);
-        if (len <= 0) {
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
             if (!running) break;
+            continue;
+        }
+        if (len == 0) {
             continue;
         }
 
@@ -168,15 +176,18 @@ int main(void) {
     char status[32];
     int capacity;
 
+    openlog("battery-monitor", LOG_PID, LOG_DAEMON);
+
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    printf("Battery monitor starting (alert: %d%%, shutdown: %d%%)\n",
+    syslog(LOG_INFO, "Battery monitor starting (alert: %d%%, shutdown: %d%%)",
            ALERT_THRESHOLD, SHUTDOWN_THRESHOLD);
 
     sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
     if (sock < 0) {
-        perror("Error creating netlink socket (need root?)");
+        syslog(LOG_ERR, "Error creating netlink socket (need root?): %m");
+        closelog();
         return 1;
     }
 
@@ -186,10 +197,16 @@ int main(void) {
     addr.nl_groups = 1;
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("Error binding netlink socket");
+        syslog(LOG_ERR, "Error binding netlink socket: %m");
         close(sock);
+        closelog();
         return 1;
     }
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (read_battery_status(status, &capacity) == 0) {
         if (strcmp(status, "Discharging") == 0) {
@@ -200,5 +217,6 @@ int main(void) {
     listen_for_ac_events(sock);
 
     close(sock);
+    closelog();
     return 0;
 }
