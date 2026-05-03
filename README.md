@@ -53,7 +53,8 @@ Edit `battery-monitor.c` and recompile to adjust thresholds:
 Adaptive check intervals:
 - Battery > 35%: check every 5 minutes
 - Battery 20-35%: check every 3 minutes
-- Battery < 20%: check every 60 seconds
+- Battery < 25%: check every 60 seconds
+- Battery < 15%: check every 30 seconds
 
 ## Behavior
 
