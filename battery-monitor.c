@@ -11,24 +11,32 @@
 #include <syslog.h>
 #include <linux/limits.h>
 
+/* Configuration Constants */
 #define ALERT_THRESHOLD 12
 #define SHUTDOWN_THRESHOLD 8
 #define ALERT_SOUND "/usr/local/share/sounds/warning-loud-shrill-chime.wav"
 #define UEVENT_BUFFER_SIZE 8192
+#define STATUS_BUFFER_SIZE 32
 
-static volatile int running = 1;
+/* Global State */
+static volatile sig_atomic_t running = 1;
+static char cached_bat_path[PATH_MAX] = "";
 
-void handle_signal(int sig) {
+/**
+ * Handle termination signals gracefully.
+ */
+static void handle_signal(int sig) {
     (void)sig;
     running = 0;
 }
 
-int read_battery_status(char *status, int *capacity) {
+/**
+ * Find the first battery in sysfs and cache its path once.
+ * Returns 0 on success, -1 if no battery is found.
+ */
+static int find_battery(void) {
     DIR *dir;
     struct dirent *entry;
-    char bat_path[PATH_MAX];
-    char file_path[PATH_MAX + 16];
-    FILE *fp;
     int found = 0;
 
     dir = opendir("/sys/class/power_supply");
@@ -39,7 +47,8 @@ int read_battery_status(char *status, int *capacity) {
 
     while ((entry = readdir(dir)) != NULL) {
         if (strncmp(entry->d_name, "BAT", 3) == 0) {
-            snprintf(bat_path, sizeof(bat_path), "/sys/class/power_supply/%s", entry->d_name);
+            snprintf(cached_bat_path, sizeof(cached_bat_path), 
+                     "/sys/class/power_supply/%s", entry->d_name);
             found = 1;
             break;
         }
@@ -47,27 +56,41 @@ int read_battery_status(char *status, int *capacity) {
     closedir(dir);
 
     if (!found) {
-        fprintf(stderr, "No battery found\n");
+        syslog(LOG_ERR, "No battery found in /sys/class/power_supply");
         return -1;
     }
 
-    snprintf(file_path, sizeof(file_path), "%s/status", bat_path);
+    return 0;
+}
+
+/**
+ * Read battery status and capacity using the cached path.
+ */
+static int read_battery_status(char *status, int *capacity) {
+    char file_path[PATH_MAX + 16];
+    FILE *fp;
+
+    if (cached_bat_path[0] == '\0') return -1;
+
+    /* Read Status */
+    snprintf(file_path, sizeof(file_path), "%s/status", cached_bat_path);
     fp = fopen(file_path, "r");
     if (!fp) {
-        perror("Error reading battery status");
+        syslog(LOG_ERR, "Error opening %s: %m", file_path);
         return -1;
     }
-    if (fgets(status, 32, fp) == NULL) {
+    if (fgets(status, STATUS_BUFFER_SIZE, fp) == NULL) {
         fclose(fp);
         return -1;
     }
     fclose(fp);
     status[strcspn(status, "\n")] = 0;
 
-    snprintf(file_path, sizeof(file_path), "%s/capacity", bat_path);
+    /* Read Capacity */
+    snprintf(file_path, sizeof(file_path), "%s/capacity", cached_bat_path);
     fp = fopen(file_path, "r");
     if (!fp) {
-        perror("Error reading battery capacity");
+        syslog(LOG_ERR, "Error opening %s: %m", file_path);
         return -1;
     }
     if (fscanf(fp, "%d", capacity) != 1) {
@@ -79,7 +102,11 @@ int read_battery_status(char *status, int *capacity) {
     return 0;
 }
 
-void play_alert(void) {
+/**
+ * Fork and execute aplay to play the alert sound.
+ * Parent does not wait; SIGCHLD is ignored in main to prevent zombies.
+ */
+static void play_alert(void) {
     pid_t pid = fork();
     if (pid < 0) {
         syslog(LOG_ERR, "fork failed: %m");
@@ -87,27 +114,30 @@ void play_alert(void) {
     }
 
     if (pid == 0) {
-        execl("/usr/local/bin/aplay", "aplay", "-q", ALERT_SOUND, NULL);
-        syslog(LOG_ERR, "execl failed: %m");
-        exit(1);
+        execl("/usr/local/bin/aplay", "aplay", "-q", ALERT_SOUND, (char *)NULL);
+        exit(EXIT_FAILURE);
     }
 }
 
-int get_check_interval(int capacity) {
-    if (capacity > 35)
-        return 300;
-    else if (capacity > 25)
-        return 180;
-    else if (capacity > 15)
-        return 60;
-    else
-        return 30;
+/**
+ * Determine polling interval based on current capacity.
+ */
+static int get_check_interval(int capacity) {
+    if (capacity > 35) return 300;
+    if (capacity > 25) return 180;
+    if (capacity > 15) return 60;
+    return 30;
 }
 
-void monitor_battery_loop(void) {
-    char status[32];
+/**
+ * Active monitoring loop when the battery is discharging.
+ */
+static void monitor_battery_loop(void) {
+    char status[STATUS_BUFFER_SIZE];
     int capacity;
     int last_alerted_capacity = -1;
+
+    syslog(LOG_INFO, "Entering active discharge monitoring");
 
     while (running) {
         if (read_battery_status(status, &capacity) != 0) {
@@ -116,55 +146,51 @@ void monitor_battery_loop(void) {
         }
 
         if (strcmp(status, "Discharging") != 0) {
+            syslog(LOG_INFO, "Power state changed to %s; stopping active monitor", status);
             return;
         }
 
         if (capacity <= SHUTDOWN_THRESHOLD) {
+            syslog(LOG_CRIT, "Battery at %d%% - emergency shutdown initiated", capacity);
             play_alert();
-            syslog(LOG_CRIT, "Battery at %d%% - initiating immediate shutdown", capacity);
-            system("/sbin/shutdown -h now 'Battery critically low - emergency shutdown'");
+            system("/sbin/shutdown -h now 'Battery critically low'");
             closelog();
-            exit(0);
+            exit(EXIT_SUCCESS);
         }
 
         if (capacity < ALERT_THRESHOLD) {
             if (capacity != last_alerted_capacity) {
-                syslog(LOG_WARNING, "Battery at %d%%", capacity);
+                syslog(LOG_WARNING, "Battery low: %d%%", capacity);
                 play_alert();
                 last_alerted_capacity = capacity;
             }
         }
 
-        int interval = get_check_interval(capacity);
-        sleep(interval);
+        sleep(get_check_interval(capacity));
     }
 }
 
-void listen_for_ac_events(int sock) {
+/**
+ * Listen for Netlink uevents from the kernel.
+ */
+static void listen_for_events(int sock) {
     char buffer[UEVENT_BUFFER_SIZE];
-    char status[32];
+    char status[STATUS_BUFFER_SIZE];
     int capacity;
-    ssize_t len;
 
     while (running) {
-        len = recv(sock, buffer, sizeof(buffer), 0);
-        if (len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            if (!running) break;
-            continue;
-        }
-        if (len == 0) {
-            continue;
+        ssize_t len = recv(sock, buffer, sizeof(buffer), 0);
+        if (len <= 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
         }
 
-        if (strstr(buffer, "power_supply") || strstr(buffer, "POWER_SUPPLY")) {
-            if (read_battery_status(status, &capacity) != 0)
-                continue;
-
-            if (strcmp(status, "Discharging") == 0) {
-                monitor_battery_loop();
+        if (strstr(buffer, "power_supply")) {
+            if (read_battery_status(status, &capacity) == 0) {
+                if (strcmp(status, "Discharging") == 0) {
+                    monitor_battery_loop();
+                }
             }
         }
     }
@@ -173,22 +199,28 @@ void listen_for_ac_events(int sock) {
 int main(void) {
     int sock;
     struct sockaddr_nl addr;
-    char status[32];
+    char status[STATUS_BUFFER_SIZE];
     int capacity;
 
     openlog("battery-monitor", LOG_PID, LOG_DAEMON);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGCHLD, SIG_IGN);
 
-    syslog(LOG_INFO, "Battery monitor starting (alert: %d%%, shutdown: %d%%)",
+    if (find_battery() != 0) {
+        closelog();
+        return EXIT_FAILURE;
+    }
+
+    syslog(LOG_INFO, "Battery monitor started (Alert: %d%%, Shutdown: %d%%)", 
            ALERT_THRESHOLD, SHUTDOWN_THRESHOLD);
 
     sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
     if (sock < 0) {
-        syslog(LOG_ERR, "Error creating netlink socket (need root?): %m");
+        syslog(LOG_ERR, "Netlink socket creation failed: %m");
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
     memset(&addr, 0, sizeof(addr));
@@ -197,15 +229,13 @@ int main(void) {
     addr.nl_groups = 1;
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        syslog(LOG_ERR, "Error binding netlink socket: %m");
+        syslog(LOG_ERR, "Netlink bind failed: %m");
         close(sock);
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     if (read_battery_status(status, &capacity) == 0) {
@@ -214,9 +244,10 @@ int main(void) {
         }
     }
 
-    listen_for_ac_events(sock);
+    listen_for_events(sock);
 
+    syslog(LOG_INFO, "Battery monitor stopping");
     close(sock);
     closelog();
-    return 0;
+    return EXIT_SUCCESS;
 }
